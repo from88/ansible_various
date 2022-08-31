@@ -1,0 +1,120 @@
+---
+  - name: Run pingdom check
+    block:
+     - assert:
+         that:
+            - "('ASR' in inventory_hostname or 'NCS' in inventory_hostname)"
+            - "('iosxr' in ansible_network_os)"
+         success_msg: inventory hostname and network os check success
+         fail_msg: inventory hostname and network os check failed
+         quiet: yes
+
+     - name: create folder to store temporary files
+       file:
+           path: /tmp/ansible/pingdomcheck
+           state: directory
+           mode: '700'
+       check_mode: no
+       run_once: true
+
+     - name: "GET ipv4 probes"
+       get_url:
+         url: https://my.pingdom.com/probes/ipv4
+         dest: /tmp/ansible/pingdomcheck/ipv4
+         force: yes
+       check_mode: no
+       run_once: true
+
+     - name: "GET ipv6 probes"
+       get_url:
+         url: https://my.pingdom.com/probes/ipv6
+         dest: /tmp/ansible/pingdomcheck/ipv6
+         force: yes
+       check_mode: no
+       run_once: true
+
+     - name: CHECK if IPV4 probe list has valid ipv4 addresses
+       shell: cat /tmp/ansible/pingdomcheck/ipv4
+       register: ipv4list
+       failed_when: ipv4list.stdout_lines != (ipv4list.stdout_lines|ipv4)
+       check_mode: no
+       run_once: true
+
+     - name: CHECK if IPV6 probe list has valid ipv6 addresses
+       shell: cat /tmp/ansible/pingdomcheck/ipv6
+       register: ipv6list
+       failed_when: ipv6list.stdout_lines != (ipv6list.stdout_lines|ipv6)
+       check_mode: no
+       run_once: true
+
+     - name: CHECK if IPV4 probe list line count is no more than {{ max_linecount }}
+       shell: wc -l /tmp/ansible/pingdomcheck/ipv4 | awk '{print $1}'
+       register: ipv4wclist
+       failed_when: ipv4wclist.stdout|int > max_linecount
+       check_mode: no
+       run_once: true
+
+     - name: CHECK if IPV6 probe list line count is no more than {{ max_linecount }}
+       shell: wc -l /tmp/ansible/pingdomcheck/ipv6 | awk '{print $1}'
+       register: ipv6wclist
+       failed_when: ipv6wclist.stdout|int > max_linecount
+       check_mode: no
+       run_once: true
+
+     - name: CHECK if IPV4 probe list line count is not less than {{ min_linecount }}
+       shell: wc -l /tmp/ansible/pingdomcheck/ipv4 | awk '{print $1}'
+       register: ipv4wclist
+       failed_when: ipv4wclist.stdout|int < min_linecount
+       check_mode: no
+       run_once: true
+
+     - name: CHECK if IPV6 probe list line count is not less than {{ min_linecount }}
+       shell: wc -l /tmp/ansible/pingdomcheck/ipv6 | awk '{print $1}'
+       register: ipv6wclist
+       failed_when: ipv6wclist.stdout|int < min_linecount
+       check_mode: no
+       run_once: true
+
+     - name: GET ipv4 and ipv6 object-groups from devices
+       iosxr_command:
+         commands:
+             - "show object-group network ipv4 External_Monitoring | include /32"
+             - "show object-group network ipv6 External_Monitoring_IPv6 | include /128"
+       register: get_config
+       failed_when: get_config.stdout[0] is not search("\/32") or get_config.stdout[1] is not search("\/128")
+
+     - name: "CHECK and CONFIGURE missing ipv4 probes if exists"
+       when: item not in get_config.stdout[0]
+       with_lines: cat /tmp/ansible/pingdomcheck/ipv4
+       iosxr_config:
+         lines: object-group network ipv4 External_Monitoring {{item}}/32
+         comment: "Ansible pingdom ipv4 check"
+       register: config_ipv4
+
+     - name: "CHECK and CONFIGURE missing ipv6 probes if exists"
+       when: item not in get_config.stdout[1]
+       with_lines: cat /tmp/ansible/pingdomcheck/ipv6
+       iosxr_config:
+         lines: object-group network ipv6 External_Monitoring_IPv6 {{item}}/128
+         comment: "Ansible pingdom ipv6 check"
+       register: config_ipv6
+
+     - name: SEND notification message when changes was done via SLACK
+       when: "(config_ipv4.changed == true) or (config_ipv6.changed == true)"
+       slack:
+        token: "{{ slack_token }}"
+        msg: "{{ inventory_hostname }} {{ ansible_host }} acl update completed : {{ config_ipv4.results | selectattr('commands','defined') | map(attribute='commands') | list }} {{ config_ipv6.results | selectattr('commands','defined') | map(attribute='commands') | list }}"
+        parse: full
+        channel: '#network-changes'
+        icon_emoji: ansible
+        username: "Ansible on AWX"
+
+    rescue:
+      - name: SEND notification message when Ansible failed
+        slack:
+         token: "{{ slack_token }}"
+         msg: "{{ inventory_hostname }} {{ ansible_host }} Ansible pingdom check job failed. Please investigate"
+         channel: '#network-alerts'
+         color: danger
+         icon_emoji: ansible
+         username: "Ansible on AWX"
