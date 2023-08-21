@@ -1,0 +1,65 @@
+netbox.yml
+
+  - name: "show int desc for all interfaces and descriptions"
+    ansible.utils.cli_parse:
+      command: 'show interface description'
+      parser: 
+        name: ansible.netcommon.pyats
+      set_fact: show_int_desc
+    
+
+  - name: set fact to make dict of 'device interfaces - port-channels' pair
+    set_fact:
+          dict_var: "{{ dict_var | default({}) | combine({item['value']['members'].keys() | list | first : item['value']['bundle_id']}) }}"                 
+    with_dict: "{{show_port_channel_summary['interfaces']}}"    
+    when: item['value']['members'].keys() is search ('Ethernet\d{1,3}\/\d\/\d{1,2}')
+
+  - name: make the PO index for each FEX
+    set_fact:          
+      index_fact: |- 
+        {%- set result = {} -%}
+        {%- for key, value in dict_var.items() -%}
+            {%- set interface = key.split('/')[0] -%}
+            {%- set vpc_temp = value|string -%}
+            {%- set vpc = vpc_temp[:2] -%}
+            {%- if interface not in result -%}
+              {%- set _ = result.update({interface: []}) -%}
+            {%- endif -%}
+            {%- if vpc not in result[interface] and result[interface]|length == 0 and value|string|length == 4: -%}
+              {%- set _ = result[interface].append(vpc) -%}
+            {%- endif -%}
+            {%- if (vpc not in result[interface] and result[interface]|length != 0 and '9999' not in result[interface]) or (value|string|length != 4 and '9999' not in result[interface]): -%}                
+              {%- set _ = result.update({interface: ['9999']}) -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{result}} 
+
+#Use po_index2 instead of po_index. Because of netbox_device_interface module cannot pass integer to Netbox. Bug id: https://github.com/netbox-community/ansible_modules/issues/985
+  - name: Create interface within NetBox when dualhomed is false 
+    netbox.netbox.netbox_device_interface:        
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        device: "{{inventory_hostname}}"
+        name: "{{ item.key }}"
+        description: "{{item['value']['description']}}"   
+        type: "other"                     
+        custom_fields:
+            "po_index2": "{{index_fact[item.key.split('/')[0]][0] | default ('9999') | string }}" 
+#           "po_index": "{{index_fact[item.key.split('/')[0]][0] | default ('9999') | int }}" 
+            "dualhomed_fex": false
+      state: "{{ netbox_state }}"
+    with_dict: "{{show_int_desc['interfaces']}}"      
+    when: item.key.split('/')[0] not in dualhomed[inventory_hostname[:8]] | default ('') and item.key is search ('^Ethernet\d{1,3}\/\d\/\d{1,2}$')	
+	
+	main:
+	
+
+  tasks: 
+    - name: Query netbox API
+      set_fact:
+        netbox_api_response: "{{ query('netbox.netbox.nb_lookup', 'interfaces',
+          api_filter= 'cf_dualhomed_fex=false device='~ ansible_hostname~' name=''Ethernet'~ full_fex_interface_number.split('/')[0],
+                    api_endpoint=netbox_api_endpoint, 
+                    token=netbox_token, validate_certs=False) }}"                   
