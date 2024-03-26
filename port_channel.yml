@@ -1,0 +1,345 @@
+---
+    - name: Query netbox API
+      set_fact:
+        netbox_api_response: "{{ query('netbox.netbox.nb_lookup', 'interfaces',
+          api_filter= 'cf_dualhomed_fex=false device='~ inventory_hostname~' name=''Ethernet'~ full_fex_interface_number.split('/')[0],
+                    api_endpoint=netbox_api_endpoint, 
+                    token=netbox_token, validate_certs=False) }}" 
+
+#po_index2 instead of po_index
+    - name: Assign port-channel index value to variable po_index
+      set_fact: 
+        netbox_po_index: "{{ netbox_api_response | json_query('[*].value.custom_fields.po_index2') }}"               
+    
+    - name: Construct a number for VPC and Port-Channel
+      set_fact:
+        vpc_pc_number: "{{ netbox_po_index[0]}}{{'%02d' % full_fex_interface_number.split('/')[-1] | int }}"
+
+    - name: Remove DC prefix from port-profile name
+      set_fact:
+        port_profile_name: "{{port_profile_name_prior.split(':')[1]}}"
+      when: port_profile_name_prior != '-'
+
+    - name: Leave port-profile zero on new variable if nothing is selected
+      set_fact:
+        port_profile_name: '-'
+      when: port_profile_name_prior == '-'
+ 
+    - debug:
+        msg:
+          - "Defined interface: {{full_fex_interface_number}}"
+          - "Defined vlans: {{vlans}}"
+          - "Defined native vlan: {{native_vlan}}"
+          - "Defined port-profile_prior: {{port_profile_name_prior}}"
+          - "Defined port-profile fixed version: {{port_profile_name}}"
+          - "Defined interfaces description: {{interface_description}}"
+          - "Defined hosts group: {{hostai}}"
+          - "Defined hosts: {{ansible_play_hosts}}"
+      run_once: true
+
+    - name: some protections, fail early
+      assert:
+        that:
+          - "('NET' in inventory_hostname)"
+          - "('nxos' in ansible_network_os)"          
+          - "(port_profile_name != '-' or vlans != '-' or native_vlan != '-')"
+          - "((port_profile_name != '-' and (vlans == '-' and native_vlan == '-')) or (port_profile_name == '-' and (vlans != '-' or native_vlan != '-')) or (port_profile_name == '-' and vlans == '-' and native_vlan == '-'))"        
+          - full_fex_interface_number is search('^\d{1,3}\/\d\/\d{1,2}$')
+          - (vlans is search('^\d.*\d$|^\d$') or vlans == '-')
+          - (native_vlan is search('^\d{1,4}$') or native_vlan == '-')
+          - vpc_pc_number is search('^\d{3,4}$')                    
+          - vars['ansible_play_hosts']|length == 2 or vars['ansible_play_hosts']|length == 1
+        success_msg: success
+        fail_msg: failed
+        quiet: yes   
+
+    - name: Check Netbox response response
+      fail:
+        msg: double check if 'netbox_api_response' is present
+      when: 
+          (vars['ansible_play_hosts']|length == 2 and (hostvars[ansible_play_hosts[0]]['netbox_api_response'][0] is not defined or hostvars[ansible_play_hosts[1]]['netbox_api_response'][0] is not defined))
+      run_once: true 
+
+    - name: Check Po index numbers
+      fail:
+        msg: check if Po index from netbox is different between pair of nodes OR if correct pair of devices are entered
+      when: 
+          (vars['ansible_play_hosts']|length == 2 and (hostvars[ansible_play_hosts[0]]['netbox_api_response'][0]['value']['custom_fields']['po_index2'] != hostvars[ansible_play_hosts[1]]['netbox_api_response'][0]['value']['custom_fields']['po_index2'] or hostvars[ansible_play_hosts[0]]['inventory_hostname'][:-1] != hostvars[ansible_play_hosts[1]]['inventory_hostname'][:-1]))
+      run_once: true 
+
+    - debug:
+        msg:
+          - "Netbox Port-Channel index: {{netbox_po_index[0]}}"
+          - "Constrcuted vpc number: {{vpc_pc_number}}"
+      run_once: true
+
+    - name: "Show device hostname to ensure inventory entry is correct"
+      nxos_command:
+        commands:
+            - "show hostname"
+      register: show_hostname      
+      failed_when: "inventory_hostname not in show_hostname.stdout[0]"          
+
+    - name: "Get Ethernet{{full_fex_interface_number}} interface information"  
+      ansible.utils.cli_parse:
+        command: 'show interface ethernet{{full_fex_interface_number}}'
+        parser: 
+          name: ansible.netcommon.pyats
+        set_fact: show_interface_info
+
+    - name: "Show port-profile brief to see if needed ({{port_profile_name}}) port-profile exists"
+      nxos_command:
+        commands:
+            - "show port-profile brief | include Port-channel"
+      register: port_profile_brief
+      when: "port_profile_name != '-' and (vlans == '-' and native_vlan == '-')" 
+      failed_when: "port_profile_name not in port_profile_brief.stdout_lines[0] | map('trim') |  map('split') | map('first')"      
+
+    - name: "Get Ethernet{{full_fex_interface_number}} physical interface running-configuration" 
+      ansible.utils.cli_parse:
+        command: 'show running-config interface ethernet{{full_fex_interface_number}}'
+        parser: 
+          name: ansible.netcommon.pyats
+        set_fact: interface_running_config
+   
+    - name: "Show port-channel database to see if port-channel{{vpc_pc_number}} exists before creation"
+      ansible.utils.cli_parse:
+        command: 'show port-channel summary'
+        parser: 
+          name: ansible.netcommon.pyats
+        set_fact: port_channel_summary_before 
+
+    - name: Construct current Po number
+      set_fact: 
+        current_po: "{{ interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['port_channel']['port_channel_int'] }}"
+      when: ('port_channel' in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number])
+
+#additional protections  
+    - name: some protections, fail later
+      assert:
+        that:          
+          - "((show_interface_info['Ethernet' ~ full_fex_interface_number]['counters']['rate']['in_rate'] < 50000000) and (show_interface_info['Ethernet' ~ full_fex_interface_number]['counters']['rate']['out_rate'] < 50000000))"                    
+          - (('ip_address' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number].keys()) or ('vrf_member' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number].keys()))
+          - (('L3' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')) and ('l3' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')))  
+          - ('MGMT0' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')) 
+          - ('MGT' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')) 
+          - ('ILO' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
+          - ('bad' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
+        success_msg: success
+        fail_msg: failed
+        quiet: yes   
+
+#Current Genie parser 23.3 for `show running-interface` could not detect static port channel configuration: https://github.com/CiscoTestAutomation/genieparser/issues/759
+#Genie parser for `show interface` doesnt see port-channel configuration under interface if interface is not in "P" mode. 
+
+    - name: Fail if the port-channel is assigned to different interface or exists without it.
+      fail:
+        msg: Port-channel is assigned to different interface or exists without it.
+      when: 
+          ('port_channel' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number] and 'Port-channel' ~ vpc_pc_number in port_channel_summary_before['interfaces'].keys())       
+
+    - name: Fail if the physical interface has other port-channel configuration.
+      fail:
+        msg: Physical interface has other port-channel configuration.
+      when:           
+          ('port_channel' in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number] and interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['port_channel']['port_channel_int'] != vpc_pc_number)                 
+
+    - name: Fail if port-channel has more than one member per FEX
+      fail:
+        msg: Port-channel has more than one member per FEX
+      when:          
+           ('port_channel' in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number] and port_channel_summary_before['interfaces']['Port-channel' ~ current_po]['members'].keys() | count > 1)                
+
+    - name: Check if existing port-channel{{vpc_pc_number}} uses LACP
+      fail:
+        msg: existing port-channel is not using LACP
+      when: 
+          (show_interface_info['Ethernet' ~ full_fex_interface_number]['port_channel']['port_channel_member'] == true and port_channel_summary_before['interfaces']['Port-channel' ~ current_po]['protocol'] != 'lacp')
+
+    - name: Check port-channel and native vlan
+      fail:
+        msg: cannot create port-channel when only native vlan (wihout trunk vlans) is entered
+      when: 
+          ('port_channel' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number] and native_vlan != '-' and vlans == '-')    
+      
+    - name: "Configure port-channel only if physical interface Ethernet{{full_fex_interface_number}} doesnt have any port-channel configuration and port-channel{{vpc_pc_number}} is not already present"
+      nxos_lag_interfaces:
+        config:
+        - name: "port-channel{{vpc_pc_number}}"
+          members:            
+          - member: "ethernet{{ full_fex_interface_number }}"            
+            mode: active
+            force: true            
+        state: merged      
+      when:         
+        - "'port_channel' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number] and 'Port-channel' ~ vpc_pc_number not in port_channel_summary_before['interfaces'].keys()"       
+
+    - name: "Show port-channel database to double check if port-channel{{vpc_pc_number}} exists after creation"
+      ansible.utils.cli_parse:
+        command: 'show port-channel summary'
+        parser: 
+          name: ansible.netcommon.pyats
+        set_fact: port_channel_summary
+
+    - name: "Get ({{inventory_hostname}}) port-channel running-configuration if port-channel{{vpc_pc_number}} exists"
+      nxos_command:
+        commands:   
+            - "show running-config interface port-channel{{vpc_pc_number}}"
+      register: portchannel_running_config
+      when: "'Port-channel' ~ vpc_pc_number in port_channel_summary['interfaces'].keys()"
+
+    - name: "Add `switchport` command under the port-channel if the {{inventory_hostname[:8]}} is in {{switchport_mandatory}}"
+      nxos_config:
+        lines:
+          - switchport
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when:  
+        - "show_hostname.stdout[0][:8] in switchport_mandatory"
+        - "inventory_hostname[:8] in switchport_mandatory"
+
+    - name: "Show VPC brief"
+      ansible.utils.cli_parse:
+        command: 'show vpc'
+        parser: 
+          name: ansible.netcommon.pyats
+        set_fact: vpc_brief
+      when: portchannel_running_config.stdout_lines[0] is defined
+      failed_when: portchannel_running_config.stdout_lines[0] is search ('\svpc\s\d{1,4}') and 'vpc ' ~ vpc_pc_number not in portchannel_running_config.stdout_lines[0] | map('trim') | list
+      
+    - name: "Configure VPC number {{vpc_pc_number}} if it doesnt exist elsewhere"      
+      nxos_config:
+        lines:
+          - "vpc {{vpc_pc_number}}"
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when: portchannel_running_config.stdout_lines[0] is defined
+      failed_when: "vpc_pc_number in vpc_brief['vpc'].keys() and 'vpc ' ~ vpc_pc_number not in portchannel_running_config.stdout_lines[0] | map('trim') | list"      
+
+    - name: "Remove wrong port-profile ({{ portchannel_running_config.stdout[0] | regex_search('inherit port-profile.*') }}) and add the specified one ({{ port_profile_name }})"
+      nxos_config:
+        lines:
+          - shutdown
+          - switchport mode trunk
+          - "no {{ portchannel_running_config.stdout[0] | regex_search('inherit port-profile.*') }}"
+          - no switchport trunk allowed vlan
+          - no switchport trunk native vlan   
+          - inherit port-profile {{port_profile_name}}                             
+          - no lacp suspend-individual
+          - no shutdown
+        parents: "interface port-channel{{vpc_pc_number}}"
+      register: change_profile
+      when: 
+        - "portchannel_running_config.stdout_lines[0] is defined and port_profile_name != '-' and vlans == '-'" 
+        - "portchannel_running_config.stdout_lines[0] is search ('inherit port-profile') and 'inherit port-profile ' ~ port_profile_name not in portchannel_running_config.stdout_lines[0] | map('trim') | list"
+
+    - name: "Add port-profile ({{port_profile_name}}) to port-channel{{vpc_pc_number}}"
+      nxos_config:
+        lines:
+          - shutdown
+          - switchport mode trunk
+          - no switchport trunk allowed vlan
+          - no switchport trunk native vlan
+          - inherit port-profile {{port_profile_name}}
+          - no lacp suspend-individual
+          - no shutdown
+        parents: "interface port-channel{{vpc_pc_number}}"
+      register: add_profile
+      when: 
+        - "portchannel_running_config.stdout_lines[0] is defined and port_profile_name != '-' and vlans == '-'" 
+        - "portchannel_running_config.stdout_lines[0] is not search ('inherit port-profile') and change_profile.changed == false" 
+
+    - name: "Remove port-profile ({{ portchannel_running_config.stdout[0] | regex_search('inherit port-profile.*') }}) to add separate vlans {{vlans}} and native vlan {{native_vlan}} (trunk vlans should be defined)"
+      nxos_config:
+        lines:
+          - shutdown
+          - switchport mode trunk
+          - "no {{ portchannel_running_config.stdout[0] | regex_search('inherit port-profile.*') }}"                        
+          - no lacp suspend-individual
+          - no shutdown
+        parents: "interface port-channel{{vpc_pc_number}}"
+      register: remove_profile
+      when: 
+        - "portchannel_running_config.stdout_lines[0] is defined and port_profile_name == '-' and vlans != '-'"        
+        - "portchannel_running_config.stdout_lines[0] is search ('inherit port-profile')"
+
+    - name: "Remove switchport access vlan if defined"
+      nxos_config:
+        lines:          
+          - no switchport access vlan
+        parents: "interface port-channel{{vpc_pc_number}}"      
+      when: 
+        - "portchannel_running_config.stdout_lines[0] is defined"
+        - "portchannel_running_config.stdout_lines[0] is search ('switchport access vlan')"
+
+    - name: "Add required native vlan ({{ native_vlan }}) "
+      nxos_config:
+        lines:
+          - switchport trunk native vlan {{native_vlan}}  
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when: 
+        - "port_profile_name == '-' and native_vlan != '-'" 
+
+    - name: "Add required trunk vlans ({{ vlans }}) "
+      nxos_config:
+        lines:
+          - switchport trunk allowed vlan {{ vlans }}  
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when: 
+        - "port_profile_name == '-' and vlans != '-'" 
+
+    - name: "Add switchport mode trunk if not defined "
+      nxos_config:
+        lines:
+          - switchport mode trunk  
+        parents: "interface port-channel{{vpc_pc_number}}"
+
+    - name: "Check and remove switchport trunk allowed vlan if port-profile is present"
+      nxos_config:
+        lines:
+          - no switchport trunk allowed vlan
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when:  
+        - "portchannel_running_config.stdout_lines[0] is defined and port_profile_name != '-' and vlans == '-'"
+        - "portchannel_running_config.stdout_lines[0] is search ('inherit port-profile') and portchannel_running_config.stdout_lines[0] is search ('switchport trunk allowed vlan')"
+
+    - name: "Check and remove switchport trunk native vlan if port-profile is present"
+      nxos_config:
+        lines:
+          - no switchport trunk native vlan
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when:  
+        - "portchannel_running_config.stdout_lines[0] is defined and port_profile_name != '-' and vlans == '-'"
+        - "portchannel_running_config.stdout_lines[0] is search ('inherit port-profile') and portchannel_running_config.stdout_lines[0] is search ('switchport trunk native vlan')" 
+        - "add_profile.changed == false and change_profile.changed == false"
+
+    - name: "Add 'no lacp suspend-individual' if port-channel{{vpc_pc_number}} is present and 'no lacp suspend-individual' is missing"      
+      nxos_config:
+        lines:
+        - shutdown
+        - no lacp suspend-individual
+        - no shutdown
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when: portchannel_running_config.stdout_lines[0] is defined and portchannel_running_config.stdout_lines[0] is not search ('no lacp suspend-individual') and add_profile.changed == false and change_profile.changed == false and remove_profile.changed == false
+
+    - name: "Add port-channel{{vpc_pc_number}} description ({{interface_description}}) if there're no description or description is wrong ({{ portchannel_running_config.stdout[0] | regex_search('description.*') }})"
+      nxos_config:
+        lines:
+        - description {{interface_description}}
+        parents: "interface port-channel{{vpc_pc_number}}" 
+      when: interface_description != '-'      
+      
+    - name: "Add Ethernet{{full_fex_interface_number}} description ({{interface_description}}) if there're no description or description is wrong ({{ interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default('no description defined') }})"
+      nxos_config:
+        lines:
+        - description {{interface_description}}
+        parents: "interface Ethernet{{full_fex_interface_number}}"
+      when: interface_description != '-' 
+
+    - name: "Unshut Ethernet{{full_fex_interface_number}} if it's admin down, from ({{switchport_mandatory}}) list, doesn't have any port-channel associated and both ports are down"
+      nxos_config:
+        lines:
+        - no shutdown
+        parents: "interface Ethernet{{full_fex_interface_number}}"
+      when:         
+        - (show_hostname.stdout[0][:8] in switchport_mandatory and inventory_hostname[:8] in switchport_mandatory)
+        - ('port_channel' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number])
+        - (hostvars[ansible_play_hosts[0]]['ansible_facts']['show_interface_info']['Ethernet' ~ full_fex_interface_number]['admin_state'] == 'down' and hostvars[ansible_play_hosts[1]]['ansible_facts']['show_interface_info']['Ethernet' ~ full_fex_interface_number]['admin_state'] == 'down')
