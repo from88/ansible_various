@@ -1,0 +1,215 @@
+---  
+  - name: Create NetBox Regions
+    netbox.netbox.netbox_region:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        name: "{{ item.region }}"
+      state: "{{ netbox_state }}"
+    loop: "{{ sites }}" 
+    when: sites is defined
+    run_once: true
+
+  - name: Create NetBox Sites
+    netbox_site:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        name: "{{ item.name }}"                    
+        region: "{{ item.region | default(omit) }}"
+        facility: "{{ item.facility | default(omit) }}"
+      state: "{{ netbox_state }}"
+    loop: "{{ sites }}" 
+    when: sites is defined
+    run_once: true
+
+  - name: Create device role within NetBox with only required information
+    netbox.netbox.netbox_device_role:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        name: "{{ item }}" 
+        color: "795548"
+      state: "{{ netbox_state }}"
+    loop: "{{ netbox_roles }}" 
+    when: netbox_roles is defined
+    run_once: true
+
+  - name: Create manufacturer within NetBox with only required information
+    netbox.netbox.netbox_manufacturer:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        name: "{{ item }}"
+      state: "{{ netbox_state }}"
+    loop: "{{ manufacturers }}" 
+    when: manufacturers is defined
+    run_once: true
+
+  - name: Create platform     
+    netbox.netbox.netbox_platform:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        name: "{{ item }}"
+      state: "{{ netbox_state }}"
+    loop: "{{ platform }}" 
+    when: platform is defined
+    run_once: true
+
+  - name: Create device type within NetBox with only required information
+    netbox.netbox.netbox_device_type:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:          
+        model: "{{ item.device_model }}"
+        manufacturer: "{{ item.device_manufacturer }}"
+        u_height: "{{ item.height | default(omit) }}"
+      state: "{{ netbox_state }}"
+    loop: "{{ device_types }}" 
+    when: device_types is defined
+    run_once: true
+
+  - name: Create device within NetBox 
+    netbox.netbox.netbox_device:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        name: "{{ item.name }}"
+        device_type: "{{ item.type }}"
+        device_role: "{{ item.role }}"
+        platform: "{{ item.platform }}"
+        site: "{{ item.site }}"
+      state: "{{ netbox_state }}"
+    loop: "{{ devices }}" 
+    when: devices is defined
+    run_once: true
+
+  - name: Create a 'dualhomed_fex' custom field on device and virtual machine
+    netbox.netbox.netbox_custom_field:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        content_types:
+          - "dcim.interface"            
+        name: dualhomed_fex
+        type: boolean
+        filter_logic: loose
+        ui_visibility: read-write
+        search_weight: 1000
+        weight: 100
+        default: false
+    run_once: true
+
+  - name: Create a 'po_index' custom field on device and virtual machine
+    netbox.netbox.netbox_custom_field:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        content_types:
+          - "dcim.interface"            
+        name: po_index
+        type: integer
+        description: "Port-channel index"
+        filter_logic: loose
+        ui_visibility: read-write
+        search_weight: 1000
+        weight: 100
+        default: null          
+    run_once: true
+
+  - name: Create a temp 'po_index2' custom field on device and virtual machine
+    netbox.netbox.netbox_custom_field:
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        content_types:
+          - "dcim.interface"            
+        name: po_index2
+        type: text
+        description: "Port-channel index2"
+        filter_logic: loose
+        ui_visibility: read-write
+        search_weight: 1000
+        weight: 100
+        default: null
+        validation_regex: "^(\\d\\d|9999)$"
+    run_once: true
+
+  - name: "show port-channel summary for Po index"
+    ansible.utils.cli_parse:
+      command: 'show port-channel summary'
+      parser: 
+        name: ansible.netcommon.pyats
+      set_fact: show_port_channel_summary 
+
+#Because of AWX bug id (too much of output freezes the AWX stops - https://github.com/ansible/awx/issues/12685) the jinja2 script to create only interfaces for FEX was done.
+  - name: Make pair of FEX and Po numbers, and then check if any not correct VPC exists.
+    set_fact:          
+      index_fact: |-                     
+        {%- set result = {} -%} 
+        {%- for interface, values in show_port_channel_summary.interfaces.items() -%}            
+            {%- for member, member_intf in values.members.items() -%}
+                {%- if member is search("Ethernet\d{1,3}\/\d\/\d{1,2}") -%}
+                    {%- set vpc_temp = values.bundle_id|string -%}
+                    {%- set vpc = vpc_temp[:2] -%}
+                    {%- set interface2 = member.split('/')[0] -%}                                                                                 
+                    {%- if interface2 not in result -%}
+                    {%- set _ = result.update({interface2: []}) -%}                      
+                    {%- endif -%}                      
+                    {%- if vpc not in result[interface2] and result[interface2]|length == 0 and vpc_temp|length == 4: -%}
+                    {%- set _ = result[interface2].append(vpc) -%}
+                    {%- endif -%}
+                    {%- if (vpc not in result[interface2] and result[interface2]|length != 0 and '9999' not in result[interface2]) or (vpc_temp|length != 4 and '9999' not in result[interface2]): -%}                
+                    {%- set _ = result.update({interface2: ['9999']}) -%}
+                    {%- endif -%}
+                {%- endif -%}                 
+            {%- endfor -%}
+        {%- endfor -%}   
+        {{ result }}    
+#Use po_index2 instead of po_index. Because of netbox_device_interface module cannot pass integer to Netbox. Bug id: https://github.com/netbox-community/ansible_modules/issues/985
+  - name: Create interface within NetBox when dualhomed is false 
+    netbox.netbox.netbox_device_interface:        
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        device: "{{inventory_hostname}}"  
+        name: "{{ item.key }}"                           
+        description: "{{inventory_hostname[:3]}}FEX{{item.key.split('Ethernet')[1]}}{{inventory_hostname|last}}"
+        type: "other"                     
+        custom_fields:
+            "po_index2": "{{item.value[0] | string }}" 
+#           "po_index": "{{index_fact[item.key.split('/')[0]][0] | default ('9999') | int }}" 
+            "dualhomed_fex": false
+      state: "{{ netbox_state }}"
+    with_dict: "{{ index_fact }}"      
+    when: item.key not in dualhomed[inventory_hostname[:8]] | default ('')
+
+  - name: Create interface within NetBox when dualhomed is true 
+    netbox.netbox.netbox_device_interface:        
+      validate_certs: "{{ validate_certs }}"
+      netbox_token: "{{ netbox_token }}"
+      netbox_url: "{{ netbox_url }}"
+      data:
+        device: "{{inventory_hostname}}"  
+        name: "{{ item.key }}"                           
+        description: "{{inventory_hostname[:3]}}FEX{{item.key.split('Ethernet')[1]}}{{inventory_hostname|last}}"
+        type: "other"                     
+        custom_fields:
+            "po_index2": "{{item.value[0] | string }}" 
+#           "po_index": "{{index_fact[item.key.split('/')[0]][0] | default ('9999') | int }}" 
+            "dualhomed_fex": true
+      state: "{{ netbox_state }}"
+    with_dict: "{{ index_fact }}"      
+    when: item.key in dualhomed[inventory_hostname[:8]] | default ('')
