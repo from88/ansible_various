@@ -43,6 +43,7 @@
           - "('NET' in inventory_hostname)"
           - "('nxos' in ansible_network_os)"          
           - "(port_profile_name != '-' or vlans != '-' or native_vlan != '-')"
+          - ((native_vlan != '-' and vlans != '-' and native_vlan in vlans.split(',')) or native_vlan == '-' or vlans == '-')
           - "((port_profile_name != '-' and (vlans == '-' and native_vlan == '-')) or (port_profile_name == '-' and (vlans != '-' or native_vlan != '-')) or (port_profile_name == '-' and vlans == '-' and native_vlan == '-'))"        
           - full_fex_interface_number is search('^\d{1,3}\/\d\/\d{1,2}$')
           - (vlans is search('^\d.*\d$|^\d$') or vlans == '-')
@@ -118,13 +119,16 @@
     - name: some protections, fail later
       assert:
         that:          
-          - "((show_interface_info['Ethernet' ~ full_fex_interface_number]['counters']['rate']['in_rate'] < 50000000) and (show_interface_info['Ethernet' ~ full_fex_interface_number]['counters']['rate']['out_rate'] < 50000000))"                    
-          - (('ip_address' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number].keys()) or ('vrf_member' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number].keys()))
+          - (((show_interface_info['Ethernet' ~ full_fex_interface_number]['counters']['rate']['in_rate'] < 50000000) and (show_interface_info['Ethernet' ~ full_fex_interface_number]['counters']['rate']['out_rate'] < 50000000)) or 'port_channel' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number])
+          - (('ip_address' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number].keys()) and ('vrf_member' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number].keys()))
           - (('L3' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')) and ('l3' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')))  
-          - ('MGMT0' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')) 
+          - ('MGMT0' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
           - ('MGT' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default ('')) 
           - ('ILO' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
           - ('bad' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
+          - ('BAD' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
+          - ('error' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))
+          - ('ERROR' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number]['description'] | default (''))          
         success_msg: success
         fail_msg: failed
         quiet: yes   
@@ -333,13 +337,22 @@
         - description {{interface_description}}
         parents: "interface Ethernet{{full_fex_interface_number}}"
       when: interface_description != '-' 
-
-    - name: "Unshut Ethernet{{full_fex_interface_number}} if it's admin down, from ({{switchport_mandatory}}) list, doesn't have any port-channel associated and both ports are down"
+    
+    - name: "Unshut Ethernet{{full_fex_interface_number}} if it's admin state down or just link state down (complimentary unshut) in older nexus case - N5K, N6K)"
+      #workaround for older Nexuses, because old Nexuses (N5K, N6K, N9K-PXE) doesnt parse admin_state from show interface module
       nxos_config:
         lines:
         - no shutdown
         parents: "interface Ethernet{{full_fex_interface_number}}"
-      when:         
-        - (show_hostname.stdout[0][:8] in switchport_mandatory and inventory_hostname[:8] in switchport_mandatory)
-        - ('port_channel' not in interface_running_config['interface']['Ethernet' ~ full_fex_interface_number])
-        - (hostvars[ansible_play_hosts[0]]['ansible_facts']['show_interface_info']['Ethernet' ~ full_fex_interface_number]['admin_state'] == 'down' and hostvars[ansible_play_hosts[1]]['ansible_facts']['show_interface_info']['Ethernet' ~ full_fex_interface_number]['admin_state'] == 'down')
+      when:
+        - (('down' in show_interface_info['Ethernet' ~ full_fex_interface_number]['admin_state'] | default ('down')) and (show_interface_info['Ethernet' ~ full_fex_interface_number]['link_state'] != 'up'))
+
+    - name: "Unshut port-channel{{vpc_pc_number}} if it's shutdowned"
+      nxos_config:
+        lines:
+          - no shutdown
+        parents: "interface port-channel{{vpc_pc_number}}"
+      when:  
+        - "portchannel_running_config.stdout_lines[0] is defined"
+        - "portchannel_running_config.stdout_lines[0] is search ('shutdown') and add_profile.changed == false and change_profile.changed == false and remove_profile.changed == false"       
+        
